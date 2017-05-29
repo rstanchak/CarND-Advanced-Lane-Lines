@@ -12,6 +12,7 @@ def plot( img, y0, y, color):
 
 def preview( lanefinder ):
     def f( img ):
+        cv2.imwrite('tmp.bmp', img)
         result = lanefinder.process_image( img )
         cv2.imshow("result", cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
         persp = cv2.cvtColor(lanefinder.viz['perspective'], cv2.COLOR_RGB2BGR)
@@ -20,9 +21,9 @@ def preview( lanefinder ):
             plot( persp, (yslice[1]+yslice[0])/2, lanefinder.viz['dhist'][idx], (0,255,0) )
             plot( persp, (yslice[1]+yslice[0])/2, lanefinder.viz['dilated'][idx], (128,0,255) )
         cv2.imshow("perspective", persp )
-        dI = lanefinder.viz['gradient']
-        minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(dI)
-        cv2.imshow("gradient", (dI-minVal)/(maxVal-minVal))
+        #dI = lanefinder.viz['gradient']
+        #minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(dI)
+        #cv2.imshow("gradient", (dI-minVal)/(maxVal-minVal))
 
         cv2.waitKey(10)
         return result
