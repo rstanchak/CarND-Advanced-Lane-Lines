@@ -1,25 +1,16 @@
 import cv2
 import numpy as np
 
-LANE_WIDTH_METERS = 3.7
-LANE_WIDTH_FEET = 12
+# constants based on U.S. regulations
+LANE_WIDTH_FEET = 12.
+LANE_LENGTH_FEET = 10.
 
-def rgb2s(img):
-    """Convert the RGB image to HSL and return the 'saturation' 
-    channel """
-    hls = cv2.cvtColor(img, cv2.COLOR_RGB2HLS)
-    return np.asarray(hls[:,:,2], dtype=np.uint8)
-
-def gaussian_blur(img, kernel_size):
-    """Applies a Gaussian Noise kernel"""
-    return cv2.GaussianBlur(img, (kernel_size, kernel_size), 0)
-
-def gradient(im):
-    """compute the x,y components of the image gradient"""
-    blurimage2=gaussian_blur(im,3)
-    Ix = cv2.Sobel(blurimage2, cv2.CV_32F,1,0)
-    Iy = cv2.Sobel(blurimage2, cv2.CV_32F,0,1)
-    return Ix,Iy
+# empirical measurements using a perspective_transform from
+# roipoly3 to destpoly below
+LANE_WIDTH_PIXELS = 657
+LANE_LENGTH_PIXELS = 180
+X_FT_PER_PX = LANE_WIDTH_FEET/LANE_WIDTH_PIXELS
+Y_FT_PER_PX = LANE_LENGTH_FEET/LANE_LENGTH_PIXELS
 
 def roipoly3():
     return np.array([(534,490),(751,490),(1120,720),(199,720)], dtype=np.float32)
@@ -30,6 +21,48 @@ def destpoly(imsize):
     x0 = w/4
     x1 = 3*w/4
     return np.array([(x0,h/4),(x1,h/4),(x1,h),(x0,h)], dtype=np.float32)
+
+def abs_sobel_thresh(im,dx,dy,thresh_value):
+    sb = cv2.Sobel(im, cv2.CV_32F,dx, dy)
+    return np.where( np.abs(sb) >= thresh_value, 1, 0)
+
+def color_thresh(rgb, v_thresh, s_thresh):
+    hls = cv2.cvtColor(rgb, cv2.COLOR_RGB2HLS)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    s_channel = hls[:,:,2]
+    s_mask = np.zeros( rgb.shape[:2], dtype=np.uint8 )
+    s_mask[ (s_channel>=s_thresh) ] = 1
+
+    v_channel = hsv[:,:,2]
+    v_mask = np.zeros( rgb.shape[:2], dtype=np.uint8 )
+    v_mask[ (v_channel>=v_thresh) ] = 1
+
+    mask = np.zeros( rgb.shape[:2], dtype=np.uint8 )
+    mask[ (s_mask==1) & (v_mask==1) ] = 1
+    return mask
+
+class Thresholder:
+    def __init__(self, rgb):
+        self.hls = cv2.cvtColor(rgb, cv2.COLOR_RGB2HLS)
+        self.hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        self.s_channel = self.hls[:,:,2]
+        self.v_channel = self.hsv[:,:,2]
+        self.s_mask = np.zeros( rgb.shape[:2], dtype=np.uint8 )
+        self.v_mask = np.zeros( rgb.shape[:2], dtype=np.uint8 )
+        self.s_x = cv2.Sobel(self.s_channel, cv2.CV_32F, 1, 0)
+        self.s_y = cv2.Sobel(self.s_channel, cv2.CV_32F, 0, 1)
+        self.sx_mask = np.zeros( rgb.shape[:2], dtype=np.uint8 )
+        self.sy_mask = np.zeros( rgb.shape[:2], dtype=np.uint8 )
+        self.mask = np.zeros_like( self.s_channel )
+
+    def threshold(self, sx_thresh=192, sy_thresh=192, v_thresh=192, s_thresh=128):
+        self.sx_mask = np.where( (np.abs(self.s_x) >= sx_thresh ), np.uint8(1), np.uint8(0))
+        self.sy_mask = np.where( (np.abs(self.s_y) >= sy_thresh ), np.uint8(1), np.uint8(0))
+        self.s_mask = np.where( (self.s_channel >= s_thresh), np.uint8(1), np.uint8(0))
+        self.v_mask = np.where( (self.v_channel >= v_thresh), np.uint8(1), np.uint8(0))
+        self.mask = np.where( ((self.sx_mask & self.sy_mask)  | (self.s_mask & self.v_mask)), np.uint8(1), np.uint8(0))
+        return self.mask
+
 
 class PerspectiveTransform:
     def __init__(self, src_pts, dst_pts, cameraMatrix,distCoeffs,newcameramtx, image_size):
@@ -82,6 +115,7 @@ class LaneFinder:
 
         bp=self.perspective_transform.backproject(mask, (rgb.shape[1], rgb.shape[0]))
         return cv2.addWeighted(bp, 0.8, rgb, 1.0, 0.0)
+
     def drawtextline(self, rgb, text, lineno):
         font = cv2.FONT_HERSHEY_PLAIN
         font_scale = 3.0
@@ -94,55 +128,61 @@ class LaneFinder:
     def drawtext( self, rgb ):
         h = rgb.shape[0]
         x = np.dot(self.lane_center, [h*h, h, 1])
-        ctr = (x - rgb.shape[1]/2)/self.lane_width*LANE_WIDTH_METERS
+        # assume image center is center of car
+        ctr = (x - rgb.shape[1]/2)*X_FT_PER_PX
         if ctr==0:
             direction = 'centered'
         elif ctr < 0:
-            direction = '{:.2f}m right of center'.format(-ctr)
+            direction = '{:.2f}ft right of center'.format(-ctr)
         else:
-            direction = '{:.2f}m left of center'.format(ctr)
+            direction = '{:.2f}ft left of center'.format(ctr)
         A,B,C = self.lane_center
-        radius = ((1 + (2*A*h+B)**2)**(3/2))/abs(2*A) * (LANE_WIDTH_METERS/self.lane_width)
-        self.drawtextline(rgb, "Radius of curvature: {}".format(int(radius)), lineno=1)
+        # the polynomial coefficients A,B,C are in warped image coordinates
+        # x = Ay^2 + By + C
+        # need corresponding A_w, B_w, C_w in world coordinates x_w, y_w
+        # where x_w = A_w*y_w^2 + B_w*y_w + C
+
+        # transform to world coordinates using scaling factors sx and sy
+        # x_w = sx * x
+        # y_w = sy * y
+        sx = X_FT_PER_PX
+        sy = Y_FT_PER_PX
+
+        # substituting x_w/sx for x and y_w/sy for y in the polynomial gives
+        # x_w/sx = A*(y_w/sy)^2 + B*(y_w/sy) + C
+        # rearranging terms gives
+        # x_w = (sx*A/sy^2)*y_w^2 + (sx*B/sy)*y_w + sx*C
+        # so the corresponding coefficients in world coordinates are...
+        A_w = sx*A/(sy*sy)
+        B_w = sx*B/sy
+        C_w = sx*C
+        
+        if A_w!=0:
+            radius = ((1 + (2*A_w*h*Y_FT_PER_PX+B_w)**2)**(3/2))/abs(2*A_w)
+            self.drawtextline(rgb, "Radius of curvature: {}ft".format(int(radius)), lineno=1)
+        else:
+            self.drawtextline(rgb, "Radius of curvature: straight road", lineno=1)
         self.drawtextline(rgb, "Vehicle is {}".format(direction), lineno=2)
         return rgb
     
-    def process_slice(self, Ix, y0, y1, win=100):
-        hist = np.sum(Ix[y0:y1,:], axis=0)
-        dhist = np.gradient(hist)
-        dilated = np.reshape(cv2.dilate(dhist,np.ones((win,1))),dhist.shape)
-        dilated = np.where(dhist==dilated, dilated, 0)
-        candidates = np.argwhere(dilated>0)
-        # center
-        y = (y1-y0)/2
-        C = np.dot( self.lane_center, [y*y, y, 1])
-        # left and right
-        C_L=int(C-self.lane_width/2)
-        C_R=int(C+self.lane_width/2)
-
-        self.viz['slice'].append((y0,y1))
-        self.viz['hist'].append(hist)
-        self.viz['dhist'].append(dhist)
-        self.viz['dilated'].append(dilated)
-        assert(C!=0)
-
-        # find best match in candidates
-        f_L=dilated[candidates]/(1+((candidates-C_L)**2))
-        self.viz['f_L'].append(f_L)
-        C_L_new = candidates[np.argmax(f_L, axis=0)][0,0]
-    
-        f_R=dilated[candidates]/(1+((candidates-C_R)**2))
-        self.viz['f_R'].append(f_R)
-        C_R_new = candidates[np.argmax(f_R, axis=0)][0,0]
-        return C_L_new, C_R_new
-  
     def drawcurve(self, rgb, curve, color, thickness):
         y = np.arange(rgb.shape[0])
         x = curve[0]*y**2 + curve[1]*y + curve[2]
         cv2.polylines(rgb, [np.array([x,y], dtype=np.int32).T], isClosed=False, color=color, thickness=thickness)
 
+    def lanepoints(self, thresh, x0, x1, ksize=49):
+        blurimage = cv2.GaussianBlur( thresh[ :, x0:x1 ].astype(np.float32), (ksize,3), 0)
+        self.viz['blurimage'] = blurimage
+        h=thresh.shape[0]
+        X = x0 + np.argmax(blurimage, axis=1)
+        Y = np.argwhere(blurimage[(np.arange(h),X-x0)]>0)
+        if len(Y)==0:
+            return None
+        X = X[Y]
+        return X,Y
+
     def process_image(self, rgb):
-        
+        win = 100
         undist, persp = self.perspective_transform(rgb)
         self.viz['undistorted'] = undist
         self.viz['perspective'] = persp
@@ -152,37 +192,46 @@ class LaneFinder:
         self.viz['f_L'] = []
         self.viz['f_R'] = []
         self.viz['slice'] = []
-        s = np.asarray(rgb2s(persp), dtype=np.float32)
-        Ix,Iy = gradient(s)
-        dI = Ix**2 + Iy**2
-        self.viz['gradient'] = dI
-        h=rgb.shape[0]
-        w=rgb.shape[1]
-        step = int(h/9)
-        left_pts=[]
-        right_pts=[]
-        y_array=[]
-        for i in range(int(h/step)):
-            y0 = i*step
-            y1 = y0+step
-            y = (y1+y0)/2
-            C_L_new, C_R_new = self.process_slice(dI, i*step, (i+1)*step)
-            cv2.line(persp, (int(C_L_new), int(y)), (int(C_R_new), int(y)), (255,255,255), 5)
-            y_array.append(y)
-            left_pts.append(C_L_new)
-            right_pts.append(C_R_new)
+        self.thresholder = Thresholder( persp )
+        threshold = self.thresholder.threshold()
+        self.viz['threshold'] = threshold
 
-        left_poly = np.polyfit(y_array, left_pts,2)
-        self.drawcurve(persp, left_poly, (255,255,0), 5)
-        right_poly = np.polyfit(y_array, right_pts,2)
-        self.drawcurve(persp, right_poly, (255,255,0), 5)
-        ctr_pts = np.hstack(
-            [np.asarray(right_pts)-self.lane_width/2,
-            np.asarray(left_pts)+self.lane_width/2])
-        self.lane_center = np.polyfit(y_array+y_array, ctr_pts,2)
-        #self.drawcurve(persp, ctr_poly, (255,0,255), 5)
+        h=persp.shape[0]
+        w=persp.shape[1]
 
-        #self.lane_width = np.average( np.subtract(right_pts,left_pts))
-        #self.lane_center[2] = C_L_new + self.lane_width/2
+        XY_l = self.lanepoints(threshold, int(w/2-self.lane_width/2-win), int(w/2))
+        XY_r = self.lanepoints(threshold, int(w/2), int(w/2+self.lane_width/2+win))
+
+        # seed lane fitter with lane lines from previous estimate
+        Y=np.arange(0,h,16).reshape(-1,1)
+        # generate Y matrix
+        Y_prev = np.vstack( [
+            np.hstack( (Y**2, Y, np.ones_like(Y), -0.5*np.ones_like(Y)) ),
+            np.hstack( (Y**2, Y, np.ones_like(Y), 0.5*np.ones_like(Y)))])
+        # compute x = [ A*y^2 + B*y + C + alpha*lane_width ] 
+        # where alpha = -0.5 for left lane and 0.5 for right lane
+        x_prev = np.matmul(Y_prev, np.hstack( [self.lane_center[:], self.lane_width]))
+        Y_array = [ Y_prev ]
+        x_array = [ x_prev.reshape(-1,1) ]
+
+        # add new measurements to x, Y points
+        if XY_l is not None:
+            x_array.append( XY_l[0].reshape(-1,1) )
+            Y_array.append( np.hstack( (XY_l[1]**2, XY_l[1], np.ones_like(XY_l[1]), -0.5*np.ones_like(XY_l[1]))))
+
+        if XY_r is not None:
+            x_array.append( XY_r[0].reshape(-1,1) )
+            Y_array.append( np.hstack( (XY_r[1]**2, XY_r[1], np.ones_like(XY_r[1]), 0.5*np.ones_like(XY_r[1]))))
+        
+        x = np.vstack( x_array )
+        Y = np.vstack( Y_array )
+
+        # solve for betaHat = [ A, B, C, w ]
+        # where Ay^2 + By + C is the lane center
+        # and w is the lane width
+        betaHat = np.linalg.solve(Y.T.dot(Y), Y.T.dot(x))
+        self.lane_center = betaHat[:3].ravel()
+        self.lane_width = betaHat[3,0]
+
         processed_image = self.drawlanes(rgb)
         return self.drawtext(processed_image)
